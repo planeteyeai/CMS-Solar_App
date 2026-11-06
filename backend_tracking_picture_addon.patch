@@ -1,0 +1,708 @@
+diff -ruN -x __pycache__ -x '*.pyc' a/accounts/attendance.py b/accounts/attendance.py
+--- a/accounts/attendance.py	2026-10-09 09:07:23.000000000 +0000
++++ b/accounts/attendance.py	2026-10-15 10:52:42.116234708 +0000
+@@ -152,6 +152,16 @@
+         # Existing attendance -> Update checkout
+         attendance = existing_attendance
+ 
++        # A late ping (queued on the phone while offline) that is older than the
++        # check-out already recorded must never move check-out backwards.
++        # The ping itself is still stored in WorkerLocation (it is part of the path).
++        if attendance.check_out is not None and timestamp < attendance.check_out:
++            return {
++                "attendance_status": attendance.status,
++                "attendance_id": attendance.id,
++                "event": "LOCATION_UPDATE",
++            }
++
+         # If they entered a real project boundary, update the project_name
+         if project_name and attendance.project_name != project_name:
+             attendance.project_name = project_name
+diff -ruN -x __pycache__ -x '*.pyc' a/accounts/migrations/0052_profile_picture.py b/accounts/migrations/0052_profile_picture.py
+--- a/accounts/migrations/0052_profile_picture.py	1970-01-01 00:00:00.000000000 +0000
++++ b/accounts/migrations/0052_profile_picture.py	2026-10-15 10:52:42.080516679 +0000
+@@ -0,0 +1,26 @@
++from django.conf import settings
++from django.db import migrations, models
++import django.db.models.deletion
++
++
++class Migration(migrations.Migration):
++
++    dependencies = [
++        # The real latest migration of the current backend (DPR approver fields).
++        ('accounts', '0051_dailyprogressreport_approved_at_and_more'),
++        migrations.swappable_dependency(settings.AUTH_USER_MODEL),
++    ]
++
++    operations = [
++        migrations.CreateModel(
++            name='ProfilePicture',
++            fields=[
++                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
++                ('image', models.BinaryField()),
++                ('content_type', models.CharField(default='image/jpeg', max_length=30)),
++                ('size_bytes', models.PositiveIntegerField(default=0)),
++                ('updated_at', models.DateTimeField(auto_now=True)),
++                ('user', models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, related_name='profile_picture', to=settings.AUTH_USER_MODEL)),
++            ],
++        ),
++    ]
+diff -ruN -x __pycache__ -x '*.pyc' a/accounts/models.py b/accounts/models.py
+--- a/accounts/models.py	2026-10-09 09:07:23.000000000 +0000
++++ b/accounts/models.py	2026-10-15 10:52:42.114895533 +0000
+@@ -3766,3 +3766,7 @@
+     VaultSite,
+     VaultTag,
+ )
++
++
++# Profile pictures (model lives in profile_picture_model.py)
++from .profile_picture_model import ProfilePicture  # noqa: E402,F401
+diff -ruN -x __pycache__ -x '*.pyc' a/accounts/profile_picture_model.py b/accounts/profile_picture_model.py
+--- a/accounts/profile_picture_model.py	1970-01-01 00:00:00.000000000 +0000
++++ b/accounts/profile_picture_model.py	2026-10-15 10:52:42.080665141 +0000
+@@ -0,0 +1,24 @@
++"""
++ProfilePicture model (kept in its own module so models.py only needs ONE import line).
++
++models.py must end with:
++    from .profile_picture_model import ProfilePicture  # noqa: E402,F401
++"""
++from django.contrib.auth.models import User
++from django.db import models
++
++
++class ProfilePicture(models.Model):
++    """Profile photo of a user, stored in the database (small JPEG/PNG/WEBP, max 300 KB)."""
++
++    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile_picture')
++    image = models.BinaryField()
++    content_type = models.CharField(max_length=30, default='image/jpeg')
++    size_bytes = models.PositiveIntegerField(default=0)
++    updated_at = models.DateTimeField(auto_now=True)
++
++    class Meta:
++        app_label = 'accounts'
++
++    def __str__(self):
++        return f'ProfilePicture({self.user_id}, {self.size_bytes} bytes)'
+diff -ruN -x __pycache__ -x '*.pyc' a/accounts/test_tracking_profile_picture.py b/accounts/test_tracking_profile_picture.py
+--- a/accounts/test_tracking_profile_picture.py	1970-01-01 00:00:00.000000000 +0000
++++ b/accounts/test_tracking_profile_picture.py	2026-10-15 10:52:42.081054635 +0000
+@@ -0,0 +1,243 @@
++"""
++Tests for: live tracking (Superadmin), worker path, profile pictures, late-ping guard.
++
++Run:  python manage.py test accounts.test_tracking_profile_picture
++"""
++import base64
++import io
++from datetime import timedelta
++
++from django.contrib.auth.models import User
++from django.test import TestCase, override_settings
++from django.utils import timezone
++from rest_framework.test import APIClient
++
++from .models import Attendance, Project, Role, UserProjectRole, WorkerLocation
++
++LIVE = '/api/dashboard/live-locations/'
++PATH = '/api/dashboard/worker-path/'
++
++
++def _jpeg(size=(48, 48), color=(200, 30, 30)):
++    from PIL import Image
++    buf = io.BytesIO()
++    Image.new('RGB', size, color).save(buf, 'JPEG')
++    return buf.getvalue()
++
++
++def _b64(b):
++    return base64.b64encode(b).decode()
++
++
++class Base(TestCase):
++    @classmethod
++    def setUpTestData(cls):
++        cls.project = Project.objects.create(name='Planeteye(Nashik)')
++        cls.se = User.objects.create_user('se1', first_name='Site', last_name='Eng', password='x')
++        cls.se2 = User.objects.create_user('se2', password='x')
++        cls.project.site_engineers.add(cls.se)
++        cls.tl = User.objects.create_user('tl1', password='x')
++        cls.pm = User.objects.create_user('pm1', password='x')
++        cls.staff = User.objects.create_user('staff1', password='x', is_staff=True)
++        cls.sa = User.objects.create_superuser('sa1', password='x')
++        for u, rn in ((cls.tl, 'TEAM_LEAD'), (cls.pm, 'PROJECT_MANAGER')):
++            role, _ = Role.objects.get_or_create(name=rn)
++            UserProjectRole.objects.create(user=u, project=cls.project, role=role)
++
++    def client_for(self, user):
++        c = APIClient()
++        c.force_authenticate(user)
++        return c
++
++    def add_path(self, user=None, n=4, inside_last=False):
++        user = user or self.se
++        now = timezone.now()
++        pts = [(19.9900, 73.7800), (19.9910, 73.7810), (19.9925, 73.7825), (19.9940, 73.7840)][:n]
++        for i, (la, lo) in enumerate(pts):
++            WorkerLocation.objects.create(
++                worker=user, latitude=la, longitude=lo,
++                timestamp=now - timedelta(minutes=10 * (len(pts) - 1 - i) + 2),
++                project_name=self.project.name, current_zone='Block-A',
++                inside_project=(inside_last or i != len(pts) - 1),
++            )
++        Attendance.objects.create(
++            worker=user, project_name=self.project.name, date=now.date(),
++            check_in=now - timedelta(minutes=45), status='ACTIVE',
++        )
++        return now
++
++
++class LiveLocationsTests(Base):
++    def test_superadmin_sees_latest_position_and_live_flag(self):
++        self.add_path()
++        r = self.client_for(self.sa).get(LIVE)
++        self.assertEqual(r.status_code, 200)
++        self.assertEqual(r.data['count'], 1)
++        row = r.data['results'][0]
++        self.assertEqual(row['worker_id'], self.se.id)
++        self.assertTrue(row['is_live'])
++        self.assertEqual(row['attendance_status'], 'ACTIVE')
++        self.assertAlmostEqual(row['latitude'], 19.9940, places=4)  # latest ping, not the first
++
++    def test_stale_ping_is_not_live(self):
++        WorkerLocation.objects.create(
++            worker=self.se, latitude=19.99, longitude=73.78,
++            timestamp=timezone.now() - timedelta(minutes=40), project_name=self.project.name)
++        Attendance.objects.create(worker=self.se, project_name=self.project.name,
++                                  date=timezone.now().date(), check_in=timezone.now() - timedelta(hours=1), status='ACTIVE')
++        row = self.client_for(self.sa).get(LIVE).data['results'][0]
++        self.assertFalse(row['is_live'])
++        self.assertGreaterEqual(row['minutes_since_update'], 40)
++
++    def test_project_filter(self):
++        self.add_path()
++        c = self.client_for(self.sa)
++        self.assertEqual(c.get(LIVE, {'project_name': 'Other'}).data['count'], 0)
++        self.assertEqual(c.get(LIVE, {'project_name': self.project.name}).data['count'], 1)
++
++    def test_only_superadmin_by_default(self):
++        for u in (self.tl, self.pm, self.se, self.staff):
++            self.assertEqual(self.client_for(u).get(LIVE).status_code, 403, u.username)
++        self.assertEqual(APIClient().get(LIVE).status_code, 401)
++
++    @override_settings(TRACKING_VIEW_ROLES={'SUPER_ADMIN', 'TEAM_LEAD'})
++    def test_tracking_view_roles_setting_extends_access(self):
++        self.assertEqual(self.client_for(self.tl).get(LIVE).status_code, 200)
++        self.assertEqual(self.client_for(self.pm).get(LIVE).status_code, 403)
++
++
++class WorkerPathTests(Base):
++    def test_path_is_ascending_with_distance_and_summary(self):
++        now = self.add_path()
++        r = self.client_for(self.sa).get(PATH, {
++            'worker_id': self.se.id,
++            'from': (now - timedelta(hours=3)).isoformat(), 'to': (now + timedelta(hours=1)).isoformat()})
++        self.assertEqual(r.status_code, 200)
++        times = [p['timestamp'] for p in r.data['points']]
++        self.assertEqual(times, sorted(times))
++        s = r.data['summary']
++        self.assertEqual(s['point_count'], 4)
++        self.assertGreater(s['distance_meters'], 400)
++        self.assertEqual(s['outside_project_points'], 1)
++        self.assertEqual(r.data['points'][1]['gap_minutes'], 10)
++        self.assertEqual(r.data['attendance']['status'], 'ACTIVE')
++
++    def test_date_parameter_and_validation(self):
++        self.add_path()
++        c = self.client_for(self.sa)
++        self.assertEqual(c.get(PATH, {'worker_id': self.se.id, 'date': str(timezone.localdate())}).status_code, 200)
++        self.assertEqual(c.get(PATH).status_code, 400)
++        self.assertEqual(c.get(PATH, {'worker_id': 999999}).status_code, 400)
++
++    def test_forbidden_for_non_superadmin(self):
++        for u in (self.tl, self.pm, self.se):
++            self.assertEqual(self.client_for(u).get(PATH, {'worker_id': self.se.id}).status_code, 403)
++
++    def test_late_ping_appears_in_time_order(self):
++        now = timezone.now()
++        for minutes_ago, lat in ((40, 19.990), (0, 19.995), (20, 19.992)):   # stored out of order
++            WorkerLocation.objects.create(worker=self.se, latitude=lat, longitude=73.78,
++                                          timestamp=now - timedelta(minutes=minutes_ago), project_name='P')
++        r = self.client_for(self.sa).get(PATH, {
++            'worker_id': self.se.id,
++            'from': (now - timedelta(hours=2)).isoformat(), 'to': (now + timedelta(hours=1)).isoformat()})
++        self.assertEqual([round(p['latitude'], 3) for p in r.data['points']], [19.990, 19.992, 19.995])
++
++
++class LatePingGuardTests(Base):
++    """POST /api/worker/location/ with an older timestamp must not move check_out backwards."""
++
++    def ping(self, minutes_ago):
++        now = self.now
++        return self.client_for(self.se).post('/api/worker/location/', {
++            'worker_id': self.se.id, 'latitude': 19.99, 'longitude': 73.78,
++            'timestamp': (now - timedelta(minutes=minutes_ago)).isoformat()}, format='json')
++
++    def test_old_ping_is_stored_but_check_out_not_moved_back(self):
++        self.now = timezone.now().replace(microsecond=0)
++        for m in (40, 30, 0):
++            self.assertEqual(self.ping(m).status_code, 201)
++        att = Attendance.objects.get(worker=self.se)
++        self.assertEqual(att.check_out, self.now)
++        before = att.total_duration
++
++        self.assertEqual(self.ping(20).status_code, 201)            # late, queued ping
++        att.refresh_from_db()
++        self.assertEqual(att.check_out, self.now)                   # unchanged
++        self.assertEqual(att.total_duration, before)
++        self.assertEqual(WorkerLocation.objects.filter(worker=self.se).count(), 4)  # still on the path
++
++    def test_in_order_pings_still_advance_check_out(self):
++        self.now = timezone.now().replace(microsecond=0)
++        self.ping(30)
++        self.ping(20)
++        self.ping(10)
++        self.assertEqual(Attendance.objects.get(worker=self.se).check_out, self.now - timedelta(minutes=10))
++
++
++class ProfilePictureTests(Base):
++    def url(self, user=None):
++        return f'/api/accounts/users/{(user or self.se).id}/profile-picture/'
++
++    def test_upload_read_replace_delete(self):
++        c = self.client_for(self.se)
++        self.assertEqual(c.get(self.url()).status_code, 404)
++
++        r = c.post(self.url(), {'image_base64': _b64(_jpeg())}, format='json')
++        self.assertEqual(r.status_code, 201)
++        self.assertEqual(r.data['content_type'], 'image/jpeg')
++
++        g = c.get(self.url())
++        self.assertEqual(g.status_code, 200)
++        self.assertEqual(g['Content-Type'], 'image/jpeg')
++        self.assertEqual(g.content[:3], b'\xff\xd8\xff')
++
++        # replace (PUT) keeps one row
++        self.assertEqual(c.put(self.url(), {'image_base64': _b64(_jpeg(color=(0, 0, 255)))}, format='json').status_code, 201)
++        from .profile_picture_model import ProfilePicture
++        self.assertEqual(ProfilePicture.objects.filter(user=self.se).count(), 1)
++
++        self.assertEqual(c.delete(self.url()).status_code, 204)
++        self.assertEqual(c.get(self.url()).status_code, 404)
++
++    def test_data_uri_prefix_is_accepted(self):
++        r = self.client_for(self.se).post(
++            self.url(), {'image_base64': 'data:image/jpeg;base64,' + _b64(_jpeg())}, format='json')
++        self.assertEqual(r.status_code, 201)
++
++    def test_validation(self):
++        c = self.client_for(self.se)
++        self.assertEqual(c.post(self.url(), {}, format='json').status_code, 400)
++        self.assertEqual(c.post(self.url(), {'image_base64': '!!!notbase64!!!'}, format='json').status_code, 400)
++        self.assertEqual(c.post(self.url(), {'image_base64': _b64(b'plain text, not an image')}, format='json').status_code, 400)
++        too_big = b'\xff\xd8\xff' + b'0' * (300 * 1024 + 10)
++        self.assertEqual(c.post(self.url(), {'image_base64': _b64(too_big)}, format='json').status_code, 400)
++
++    def test_permissions(self):
++        self.client_for(self.se).post(self.url(), {'image_base64': _b64(_jpeg())}, format='json')
++        # read: self, superadmin, managers (TL/PM/staff) – not other engineers
++        for u, code in ((self.se, 200), (self.sa, 200), (self.tl, 200), (self.pm, 200), (self.staff, 200), (self.se2, 403)):
++            self.assertEqual(self.client_for(u).get(self.url()).status_code, code, u.username)
++        # write: self and superadmin only
++        body = {'image_base64': _b64(_jpeg())}
++        for u, code in ((self.sa, 201), (self.tl, 403), (self.pm, 403), (self.staff, 403), (self.se2, 403)):
++            self.assertEqual(self.client_for(u).post(self.url(), body, format='json').status_code, code, u.username)
++        self.assertEqual(self.client_for(self.tl).delete(self.url()).status_code, 403)
++        self.assertEqual(APIClient().get(self.url()).status_code, 401)
++        self.assertEqual(self.client_for(self.sa).get('/api/accounts/users/999999/profile-picture/').status_code, 404)
++
++    def test_me_returns_picture_flags(self):
++        c = self.client_for(self.se)
++        me = c.get('/api/accounts/me/').data
++        self.assertFalse(me['has_profile_picture'])
++        self.assertIsNone(me['profile_picture_updated_at'])
++        c.post(self.url(), {'image_base64': _b64(_jpeg())}, format='json')
++        me = c.get('/api/accounts/me/').data
++        self.assertTrue(me['has_profile_picture'])
++        self.assertTrue(me['profile_picture_updated_at'])
++
++    def test_picture_flag_in_live_locations(self):
++        self.add_path()
++        self.client_for(self.se).post(self.url(), {'image_base64': _b64(_jpeg())}, format='json')
++        row = self.client_for(self.sa).get(LIVE).data['results'][0]
++        self.assertTrue(row['has_profile_picture'])
+diff -ruN -x __pycache__ -x '*.pyc' a/accounts/urls.py b/accounts/urls.py
+--- a/accounts/urls.py	2026-10-09 09:07:23.000000000 +0000
++++ b/accounts/urls.py	2026-10-15 10:52:42.115379822 +0000
+@@ -2,6 +2,7 @@
+ from rest_framework.routers import DefaultRouter
+ 
+ from .views import CurrentUserView, ProjectAssignmentViewSet
++from .views_tracking import ProfilePictureView
+ from .views_epc import EPCViewSet, UserEpcProjectAssignmentViewSet
+ from .views_api_gaps import (
+     InboxMessageViewSet,
+@@ -26,6 +27,7 @@
+     # invite must be registered before users/<pk>/ so "invite" is not captured as an id
+     path('users/invite/', UserInviteView.as_view(), name='user_invite'),
+     path('users/<int:pk>/', UserDetailView.as_view(), name='user_detail'),
++    path('users/<int:user_id>/profile-picture/', ProfilePictureView.as_view(), name='user_profile_picture'),
+     path('password-reset/', PasswordResetRequestView.as_view(), name='password_reset'),
+     path('password-reset/confirm/', PasswordResetConfirmView.as_view(), name='password_reset_confirm'),
+     path('', include(router.urls)),
+diff -ruN -x __pycache__ -x '*.pyc' a/accounts/urls_dashboard.py b/accounts/urls_dashboard.py
+--- a/accounts/urls_dashboard.py	2026-10-09 09:07:23.000000000 +0000
++++ b/accounts/urls_dashboard.py	2026-10-15 10:52:42.115214242 +0000
+@@ -17,6 +17,7 @@
+     AIDataZoneAPIView,
+ )
+ from .views_command_center import CommandCenterAPIView
++from .views_tracking import LiveLocationsView, WorkerPathView
+ from .views_dashboard_overview import DashboardOverviewAPIView
+ 
+ urlpatterns = [
+@@ -29,6 +30,8 @@
+     # Dashboard live updates
+     path('liveliness/', LivelinessAPIView.as_view(), name='dashboard-liveliness'),
+     path('workers/', ZoneWorkerAPIView.as_view(), name='dashboard-workers'),
++    path('live-locations/', LiveLocationsView.as_view(), name='dashboard-live-locations'),
++    path('worker-path/', WorkerPathView.as_view(), name='dashboard-worker-path'),
+     path('activity-feed/', ActivityFeedAPIView.as_view(), name='dashboard-activity-feed'),
+ 
+     # Rich analytics queries
+diff -ruN -x __pycache__ -x '*.pyc' a/accounts/views.py b/accounts/views.py
+--- a/accounts/views.py	2026-10-09 09:07:23.000000000 +0000
++++ b/accounts/views.py	2026-10-15 10:52:42.116037054 +0000
+@@ -338,10 +338,15 @@
+             is_full_access=is_super_admin or highest_role == 'SUPER_ADMIN' or epc_scope.get('has_all_epc_access'),
+         )
+ 
++        from accounts.profile_picture_model import ProfilePicture
++        pic_updated = ProfilePicture.objects.filter(user=user).values_list('updated_at', flat=True).first()
++
+         return Response(
+             {
+                 'id': user.id,
+                 'username': user.username,
++                'has_profile_picture': pic_updated is not None,
++                'profile_picture_updated_at': pic_updated,
+                 'first_name': user.first_name,
+                 'last_name': user.last_name,
+                 'email': user.email,
+diff -ruN -x __pycache__ -x '*.pyc' a/accounts/views_tracking.py b/accounts/views_tracking.py
+--- a/accounts/views_tracking.py	1970-01-01 00:00:00.000000000 +0000
++++ b/accounts/views_tracking.py	2026-10-15 10:52:42.080730427 +0000
+@@ -0,0 +1,310 @@
++"""
++Live tracking + profile pictures (mobile app).
++
++GET    /api/dashboard/live-locations/?project_name=&since_hours=16   latest position of every tracked worker  (superadmin)
++GET    /api/dashboard/worker-path/?worker_id=&date= | &from=&to=     the path a worker travelled             (superadmin)
++GET    /api/accounts/users/<id>/profile-picture/                     image bytes
++POST   /api/accounts/users/<id>/profile-picture/   (or PUT)          {"image_base64": "...", "content_type": "image/jpeg"}
++DELETE /api/accounts/users/<id>/profile-picture/
++"""
++import base64
++import binascii
++import math
++from datetime import datetime, time, timedelta
++
++from django.conf import settings
++from django.contrib.auth.models import User
++from django.http import HttpResponse
++from django.utils import timezone
++from django.utils.dateparse import parse_date, parse_datetime
++from rest_framework import status as http
++from rest_framework.permissions import IsAuthenticated
++from rest_framework.response import Response
++from rest_framework.views import APIView
++
++from .models import Attendance, UserProjectRole, WorkerLocation
++from .profile_picture_model import ProfilePicture
++
++MAX_PICTURE_BYTES = 300 * 1024
++MAX_PATH_POINTS = 2000
++LIVE_STALE_MINUTES = 25   # a worker pinging every 10 min is "live" while the last ping is newer than this
++
++
++# ── permissions ────────────────────────────────────────────────────────────
++# Self-contained on purpose: nothing here imports helpers from views.py or
++# site_roles.py, so this module keeps working if those are refactored.
++
++SUPER_ADMIN_NAMES = {'SUPER_ADMIN', 'Super Admin'}
++
++# Roles that may READ a profile picture of any user (never write).
++MANAGER_ROLE_NAMES = {
++    'SUPER_ADMIN', 'Super Admin', 'PMC_HEAD', 'PMC Head',
++    'PROJECT_MANAGER', 'Project Manager', 'TEAM_LEAD', 'Team Lead', 'Team Leader',
++    'COORDINATOR', 'Coordinator',
++}
++
++
++def _roles(user):
++    names = set(user.groups.values_list('name', flat=True))
++    names |= set(UserProjectRole.objects.filter(user=user).values_list('role__name', flat=True))
++    return names
++
++
++def _can_view_tracking(user):
++    """Superadmin only by default. Extend with settings.TRACKING_VIEW_ROLES (no code change)."""
++    if user.is_superuser:
++        return True
++    allowed = set(getattr(settings, 'TRACKING_VIEW_ROLES', SUPER_ADMIN_NAMES))
++    return bool(_roles(user) & allowed)
++
++
++def _is_manager(user):
++    return bool(user.is_superuser or user.is_staff or (_roles(user) & MANAGER_ROLE_NAMES))
++
++
++def _forbidden(msg):
++    return Response({'detail': msg}, status=http.HTTP_403_FORBIDDEN)
++
++
++def _name(u):
++    return (u.get_full_name() or u.username).strip()
++
++
++# ── helpers ────────────────────────────────────────────────────────────────
++
++def haversine_m(lat1, lon1, lat2, lon2):
++    r = 6371000.0
++    p1, p2 = math.radians(lat1), math.radians(lat2)
++    dp, dl = p2 - p1, math.radians(lon2 - lon1)
++    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
++    return 2 * r * math.asin(min(1.0, math.sqrt(a)))
++
++
++def _picture_info(user_ids):
++    """{user_id: updated_at} for users that have a picture."""
++    return dict(ProfilePicture.objects.filter(user_id__in=user_ids).values_list('user_id', 'updated_at'))
++
++
++# ── live positions ─────────────────────────────────────────────────────────
++
++class LiveLocationsView(APIView):
++    permission_classes = [IsAuthenticated]
++
++    def get(self, request):
++        if not _can_view_tracking(request.user):
++            return _forbidden('Only the superadmin can view live tracking.')
++
++        try:
++            hours = max(1, min(int(request.query_params.get('since_hours', 16)), 72))
++        except ValueError:
++            hours = 16
++        now = timezone.now()
++        since = now - timedelta(hours=hours)
++
++        qs = WorkerLocation.objects.filter(timestamp__gte=since).select_related('worker')
++        project = (request.query_params.get('project_name') or '').strip()
++        if project:
++            qs = qs.filter(project_name=project)
++
++        latest = {}
++        for loc in qs.order_by('-timestamp')[:20000]:
++            latest.setdefault(loc.worker_id, loc)
++
++        att = {}
++        for a in Attendance.objects.filter(worker_id__in=latest.keys(), check_in__gte=since).order_by('check_in'):
++            att[a.worker_id] = a  # newest wins
++
++        pics = _picture_info(latest.keys())
++        rows = []
++        for wid, loc in latest.items():
++            a = att.get(wid)
++            minutes = int((now - loc.timestamp).total_seconds() // 60)
++            is_live = (a is not None and a.status == Attendance.Status.ACTIVE and minutes <= LIVE_STALE_MINUTES)
++            rows.append({
++                'worker_id': wid,
++                'username': loc.worker.username,
++                'full_name': _name(loc.worker),
++                'has_profile_picture': wid in pics,
++                'profile_picture_updated_at': pics.get(wid),
++                'latitude': float(loc.latitude),
++                'longitude': float(loc.longitude),
++                'timestamp': loc.timestamp,
++                'minutes_since_update': minutes,
++                'zone': loc.current_zone,
++                'project_name': loc.project_name,
++                'inside_project': loc.inside_project,
++                'attendance_status': a.status if a else None,
++                'check_in': a.check_in if a else None,
++                'check_out': a.check_out if a else None,
++                'is_live': is_live,
++            })
++        rows.sort(key=lambda r: (not r['is_live'], r['minutes_since_update']))
++        return Response({'count': len(rows), 'updated_at': now, 'results': rows})
++
++
++# ── path ───────────────────────────────────────────────────────────────────
++
++class WorkerPathView(APIView):
++    permission_classes = [IsAuthenticated]
++
++    def get(self, request):
++        if not _can_view_tracking(request.user):
++            return _forbidden('Only the superadmin can view worker paths.')
++
++        worker_id = request.query_params.get('worker_id')
++        worker = User.objects.filter(pk=worker_id).first() if worker_id else None
++        if worker is None:
++            return Response({'detail': 'A valid worker_id is required.'}, status=http.HTTP_400_BAD_REQUEST)
++
++        # Time window: explicit UTC range (preferred; the app sends its local day) or a calendar date.
++        start = parse_datetime(request.query_params.get('from', '') or '')
++        end = parse_datetime(request.query_params.get('to', '') or '')
++        if start is None or end is None:
++            d = parse_date(request.query_params.get('date', '') or '') or timezone.localdate()
++            tz = timezone.get_current_timezone()
++            start = timezone.make_aware(datetime.combine(d, time.min), tz)
++            end = start + timedelta(days=1)
++        if timezone.is_naive(start):
++            start = timezone.make_aware(start, timezone.utc)
++        if timezone.is_naive(end):
++            end = timezone.make_aware(end, timezone.utc)
++
++        locs = list(
++            WorkerLocation.objects.filter(worker=worker, timestamp__gte=start, timestamp__lt=end)
++            .order_by('timestamp')[:MAX_PATH_POINTS]
++        )
++
++        points, total, outside, prev = [], 0.0, 0, None
++        for loc in locs:
++            lat, lon = float(loc.latitude), float(loc.longitude)
++            seg = haversine_m(prev[0], prev[1], lat, lon) if prev else 0.0
++            gap = int((loc.timestamp - prev[2]).total_seconds() // 60) if prev else 0
++            total += seg
++            if not loc.inside_project:
++                outside += 1
++            points.append({
++                'id': loc.id,
++                'latitude': lat,
++                'longitude': lon,
++                'timestamp': loc.timestamp,
++                'zone': loc.current_zone,
++                'project_name': loc.project_name,
++                'inside_project': loc.inside_project,
++                'segment_meters': round(seg, 1),
++                'gap_minutes': gap,
++            })
++            prev = (lat, lon, loc.timestamp)
++
++        att = (
++            Attendance.objects.filter(worker=worker, check_in__gte=start - timedelta(hours=12), check_in__lt=end)
++            .order_by('-check_in').first()
++        )
++        pic = ProfilePicture.objects.filter(user=worker).values_list('updated_at', flat=True).first()
++        duration = int((locs[-1].timestamp - locs[0].timestamp).total_seconds() // 60) if len(locs) > 1 else 0
++
++        return Response({
++            'worker': {
++                'id': worker.id,
++                'username': worker.username,
++                'full_name': _name(worker),
++                'has_profile_picture': pic is not None,
++                'profile_picture_updated_at': pic,
++            },
++            'from': start,
++            'to': end,
++            'points': points,
++            'summary': {
++                'point_count': len(points),
++                'distance_meters': round(total, 1),
++                'first_timestamp': locs[0].timestamp if locs else None,
++                'last_timestamp': locs[-1].timestamp if locs else None,
++                'duration_minutes': duration,
++                'outside_project_points': outside,
++                'truncated': len(locs) >= MAX_PATH_POINTS,
++            },
++            'attendance': {
++                'status': att.status,
++                'check_in': att.check_in,
++                'check_out': att.check_out,
++                'total_duration_seconds': (
++                    att.total_duration.total_seconds() if att.total_duration else None
++                ),
++            } if att else None,
++        })
++
++
++# ── profile picture ────────────────────────────────────────────────────────
++
++def _detect_type(b: bytes):
++    if b[:3] == b'\xff\xd8\xff':
++        return 'image/jpeg'
++    if b[:8] == b'\x89PNG\r\n\x1a\n':
++        return 'image/png'
++    if b[:4] == b'RIFF' and b[8:12] == b'WEBP':
++        return 'image/webp'
++    return None
++
++
++class ProfilePictureView(APIView):
++    permission_classes = [IsAuthenticated]
++
++    def _target(self, request, user_id, write):
++        target = User.objects.filter(pk=user_id).first()
++        if target is None:
++            return None, Response({'detail': 'User not found.'}, status=http.HTTP_404_NOT_FOUND)
++        me = request.user
++        if me.pk == target.pk or me.is_superuser or _can_view_tracking(me):
++            return target, None
++        if not write and _is_manager(me):
++            return target, None
++        return None, _forbidden('You cannot access this profile picture.')
++
++    def get(self, request, user_id):
++        target, err = self._target(request, user_id, write=False)
++        if err:
++            return err
++        pic = ProfilePicture.objects.filter(user=target).first()
++        if pic is None:
++            return Response({'detail': 'No profile picture.'}, status=http.HTTP_404_NOT_FOUND)
++        resp = HttpResponse(bytes(pic.image), content_type=pic.content_type)
++        resp['Cache-Control'] = 'private, max-age=300'
++        resp['ETag'] = f'"{int(pic.updated_at.timestamp())}"'
++        return resp
++
++    def post(self, request, user_id):
++        target, err = self._target(request, user_id, write=True)
++        if err:
++            return err
++        raw = str(request.data.get('image_base64') or '')
++        if raw.startswith('data:') and ',' in raw:
++            raw = raw.split(',', 1)[1]
++        try:
++            data = base64.b64decode(raw, validate=False)
++        except (binascii.Error, ValueError):
++            return Response({'image_base64': 'Not valid base64.'}, status=http.HTTP_400_BAD_REQUEST)
++        if not data:
++            return Response({'image_base64': 'An image is required.'}, status=http.HTTP_400_BAD_REQUEST)
++        if len(data) > MAX_PICTURE_BYTES:
++            return Response(
++                {'image_base64': f'Image is larger than {MAX_PICTURE_BYTES // 1024} KB.'},
++                status=http.HTTP_400_BAD_REQUEST,
++            )
++        ctype = _detect_type(data)
++        if ctype is None:
++            return Response({'image_base64': 'Only JPEG, PNG or WEBP images are allowed.'}, status=http.HTTP_400_BAD_REQUEST)
++        pic, _ = ProfilePicture.objects.update_or_create(
++            user=target, defaults={'image': data, 'content_type': ctype, 'size_bytes': len(data)}
++        )
++        return Response(
++            {'user_id': target.id, 'content_type': ctype, 'size_bytes': len(data), 'updated_at': pic.updated_at},
++            status=http.HTTP_201_CREATED,
++        )
++
++    put = post
++
++    def delete(self, request, user_id):
++        target, err = self._target(request, user_id, write=True)
++        if err:
++            return err
++        ProfilePicture.objects.filter(user=target).delete()
++        return Response(status=http.HTTP_204_NO_CONTENT)
